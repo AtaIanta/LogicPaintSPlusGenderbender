@@ -1,0 +1,35 @@
+name: Build Patch DLL
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            make
+
+      - name: Build with Make
+        shell: msys2 {0}
+        run: |
+          make all
+
+      - name: Upload winmm.dll
+        uses: actions/upload-artifact@v4
+        with:
+          name: winmm-patch-dll
+          path: winmm.dll
