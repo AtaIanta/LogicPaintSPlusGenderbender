@@ -8,7 +8,7 @@ A customization tool for *Hatsune Miku Logic Paint S+*.
 - **Persistence**: Settings are saved automatically.
 
 ## Quick Start
-1. Download `winmm.dll` from the **Actions** tab.
+1. Download `winmm.dll` from the **Realeses** tab on the right.
 2. Place `winmm.dll` into the game root.
 3. Start the game.
    - *Note: The `mods/` folder and config will be generated automatically on first run.*
