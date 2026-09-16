@@ -15,3 +15,22 @@ extern bool g_ShowOverlay;
 void InitImGuiHook();
 void LoadOverrides();
 void SaveOverrides();
+
+// Theme override: 0 = Default (Stage's own theme), 1 = Miku, 2 = Rin, 3 = Len, 4 = Luka, 5 = Meiko, 6 = Kaito, 7 = Other
+extern int g_ThemeOverride;
+
+void RequestAutoSolve();
+void RequestThemeChange(int theme);
+void RequestUnlockTamagotoriJigsaw();
+bool IsInPuzzle();
+bool IsPuzzleCleared();
+bool AreTamagotoriJigsawUnlocked();
+void LoadThemeConfig();
+void SaveThemeConfig();
+
+// --- Cheat Settings Toggles ---
+extern bool IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame;
+extern bool IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW;
+
+void LoadCheatConfig();
+void SaveCheatConfig();

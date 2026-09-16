@@ -16,3 +16,5 @@ $(OUT): $(SRC_DIR)/winmm_proxy.cpp $(SRC_DIR)/patcher.cpp $(SRC_DIR)/imgui_hook.
 
 clean:
 	del /F /Q $(OUT)
+
+

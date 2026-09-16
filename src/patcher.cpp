@@ -52,6 +52,10 @@ typedef MonoJitInfo *(*mono_jit_info_table_find_t)(MonoDomain *domain,
 typedef MonoMethod *(*mono_jit_info_get_method_t)(MonoJitInfo *ji);
 typedef const char *(*mono_method_get_name_t)(MonoMethod *method);
 typedef char *(*mono_method_full_name_t)(MonoMethod *method, int signature);
+typedef MonoMethod *(*mono_class_get_method_from_name_t)(MonoClass *klass,
+                                                         const char *name,
+                                                         int param_count);
+typedef uintptr_t (*mono_array_length_t)(MonoArray *array);
 
 mono_get_root_domain_t mono_get_root_domain;
 mono_thread_attach_t mono_thread_attach;
@@ -70,6 +74,8 @@ mono_jit_info_table_find_t mono_jit_info_table_find;
 mono_jit_info_get_method_t mono_jit_info_get_method;
 mono_method_get_name_t mono_method_get_name;
 mono_method_full_name_t mono_method_full_name;
+mono_class_get_method_from_name_t mono_class_get_method_from_name;
+mono_array_length_t mono_array_length;
 
 extern bool g_ConsoleEnabled;
 extern bool g_DisableCrashHandler;
@@ -233,6 +239,318 @@ __thread char t_PendingHead[128] = "";
 __thread char t_PendingBody[128] = "";
 XRayTrap g_XRay = {{}, NULL, NULL};
 
+// --- Extended Mod State: Theme, AutoSolve, Bonus Stages ---
+int g_ThemeOverride = 0;
+bool g_RequestAutoSolve = false;
+int g_PendingThemeChange = -1;
+bool g_RequestUnlockTamagotoriJigsaw = false;
+bool g_TamagotoriJigsawUnlocked = false;
+void *g_pCurrentGameMng = nullptr;
+void *g_pCurrentMainMenu = nullptr;
+DWORD g_LastGameMngTick = 0;
+int g_LastOriginalStage = 1;
+BYTE g_OrigByte_PuzzleBg_init = 0;
+
+typedef void (*PS_Stage_onPaintCursor_fn)(void *pStage, int x, int y, int state);
+static PS_Stage_onPaintCursor_fn pfn_PS_Stage_onPaintCursor = nullptr;
+
+typedef void (*PS_Stage_stageClear_fn)(void *pStage);
+static PS_Stage_stageClear_fn pfn_PS_Stage_stageClear = nullptr;
+
+typedef void (*PS_PuzzleBg_init_fn)(void *pBg, int stage);
+static PS_PuzzleBg_init_fn pfn_PS_PuzzleBg_init = nullptr;
+
+typedef void (*PS_PuzzleBg_releaseData_fn)(void *pBg);
+static PS_PuzzleBg_releaseData_fn pfn_PS_PuzzleBg_releaseData = nullptr;
+
+typedef bool (*MainMenu_checkPastSoft_fn)(void *pMainMenu);
+static MainMenu_checkPastSoft_fn pfn_MainMenu_checkPastSoft = nullptr;
+
+// Dynamic field offsets
+static int g_Off_GameMng_stage = -1;
+static int g_Off_GameMng_scene = -1;
+static int g_Off_GameMng_isUsedHint = -1;
+static int g_Off_GameMng_isClear = -1;
+static int g_Off_GameMng_isStartGame = -1;
+
+static int g_Off_Puzzle_bg = -1;
+
+static int g_Off_Stage_verLines = -1;
+
+static int g_Off_Line_blocks = -1;
+
+static int g_Off_Block_data = -1;
+
+static int g_Off_BlockData_ANSWER = -1;
+static int g_Off_BlockData_State = -1;
+
+void LoadThemeConfig() {
+  g_ThemeOverride = 0;
+  CreateDirectoryA("mods", NULL);
+  FILE *f = fopen("mods/theme_override.ini", "r");
+  if (!f) return;
+  int theme = 0;
+  if (fscanf(f, "%d", &theme) == 1) {
+    if (theme >= 0 && theme <= 7) {
+      g_ThemeOverride = theme;
+    }
+  }
+  fclose(f);
+  Log("[Patcher] Loaded theme override: %d\n", g_ThemeOverride);
+}
+
+void SaveThemeConfig() {
+  CreateDirectoryA("mods", NULL);
+  FILE *f = fopen("mods/theme_override.ini", "w");
+  if (!f) return;
+  fprintf(f, "%d\n", g_ThemeOverride);
+  fclose(f);
+}
+
+void LoadUnlockFlag() {
+  FILE *f = fopen("mods/unlock_sp.flag", "r");
+  if (f) {
+    g_TamagotoriJigsawUnlocked = true;
+    fclose(f);
+  }
+}
+
+void SaveUnlockFlag() {
+  CreateDirectoryA("mods", NULL);
+  FILE *f = fopen("mods/unlock_sp.flag", "w");
+  if (f) {
+    fprintf(f, "1\n");
+    fclose(f);
+  }
+}
+
+// --- Cheat Settings Toggles ---
+bool IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame = false;
+bool IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW = false;
+
+void SaveCheatConfig() {
+  CreateDirectoryA("mods", NULL);
+  FILE *f = fopen("mods/cheats.ini", "w");
+  if (!f) return;
+  fprintf(f, "IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame=%d\n",
+          IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame ? 1 : 0);
+  fprintf(f, "IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW=%d\n",
+          IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW ? 1 : 0);
+  fclose(f);
+}
+
+void LoadCheatConfig() {
+  IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame = false;
+  IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW = false;
+  CreateDirectoryA("mods", NULL);
+  FILE *f = fopen("mods/cheats.ini", "r");
+  if (!f) {
+    SaveCheatConfig();
+    Log("[Patcher] Created default mods/cheats.ini with cheats disabled (0).\n");
+    return;
+  }
+  char line[256];
+  while (fgets(line, sizeof(line), f)) {
+    int val = 0;
+    if (sscanf(line, "IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame=%d", &val) == 1) {
+      IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame = (val != 0);
+    } else if (sscanf(line, "IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW=%d", &val) == 1) {
+      IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW = (val != 0);
+    }
+  }
+  fclose(f);
+  Log("[Patcher] Loaded cheats from mods/cheats.ini: autosolve=%d unlock=%d\n",
+      IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame ? 1 : 0,
+      IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW ? 1 : 0);
+}
+
+void RequestAutoSolve() {
+  if (!IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame) {
+    Log("[Patcher] AutoSolve ignored: cheat disabled (IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame=0).\n");
+    return;
+  }
+  g_RequestAutoSolve = true;
+  Log("[Patcher] AutoSolve requested.\n");
+}
+
+void RequestThemeChange(int theme) {
+  g_ThemeOverride = theme;
+  SaveThemeConfig();
+  g_PendingThemeChange = theme;
+  Log("[Patcher] Theme change requested: %d\n", theme);
+}
+
+void RequestUnlockTamagotoriJigsaw() {
+  if (!IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW) {
+    Log("[Patcher] Unlock Tamagotori & Jigsaw ignored: cheat disabled (IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW=0).\n");
+    return;
+  }
+  g_RequestUnlockTamagotoriJigsaw = true;
+  g_TamagotoriJigsawUnlocked = true;
+  SaveUnlockFlag();
+  Log("[Patcher] Unlock Tamagotori & Jigsaw requested.\n");
+}
+
+bool IsInPuzzle() {
+  return (g_pCurrentGameMng != nullptr && (GetTickCount() - g_LastGameMngTick < 500));
+}
+
+bool IsPuzzleCleared() {
+  if (!IsInPuzzle()) return false;
+  if (g_Off_GameMng_isClear >= 0 && g_pCurrentGameMng) {
+    if (!IsBadReadPtr(g_pCurrentGameMng, 0x100)) {
+      return *(bool *)((char *)g_pCurrentGameMng + g_Off_GameMng_isClear);
+    }
+  }
+  return false;
+}
+
+bool AreTamagotoriJigsawUnlocked() {
+  return g_TamagotoriJigsawUnlocked;
+}
+
+void InstallHook(void *target, const char *funcName) {
+  if (!target) return;
+  HookData hook;
+  hook.target = target;
+  hook.originalByte = *(BYTE *)target;
+  hook.funcName = funcName;
+  g_XRay.hooks.push_back(hook);
+
+  DWORD old;
+  if (VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &old)) {
+    *(BYTE *)target = 0xCC;
+    VirtualProtect(target, 1, old, &old);
+    Log("[Patcher] Hook Active: %s @ %p\n", funcName, target);
+  }
+}
+
+static int GetFieldOffset(MonoClass *klass, const char *name) {
+  if (!klass || !name || !mono_class_get_field_from_name || !mono_field_get_offset)
+    return -1;
+  MonoClassField *field = mono_class_get_field_from_name(klass, name);
+  if (!field) {
+    Log("[Patcher] Field %s not found on class.\n", name);
+    return -1;
+  }
+  return (int)mono_field_get_offset(field);
+}
+
+void ExecuteThemeChange(void *pGameMng, int theme) {
+  if (!pGameMng || IsBadReadPtr(pGameMng, 0x100)) return;
+  if (g_Off_GameMng_scene < 0 || g_Off_Puzzle_bg < 0) return;
+  void *pScene = *(void **)((char *)pGameMng + g_Off_GameMng_scene);
+  if (!pScene || IsBadReadPtr(pScene, 0x100)) return;
+  void *pBg = *(void **)((char *)pScene + g_Off_Puzzle_bg);
+  if (!pBg || IsBadReadPtr(pBg, 0x100)) return;
+
+  int stageToApply = theme;
+  if (stageToApply <= 0) {
+    stageToApply = (g_LastOriginalStage > 0) ? g_LastOriginalStage : 1;
+  }
+
+  if (pfn_PS_PuzzleBg_releaseData && pfn_PS_PuzzleBg_init) {
+    DWORD oldProt;
+    VirtualProtect((void *)pfn_PS_PuzzleBg_init, 1, PAGE_EXECUTE_READWRITE, &oldProt);
+    *(BYTE *)pfn_PS_PuzzleBg_init = g_OrigByte_PuzzleBg_init;
+    VirtualProtect((void *)pfn_PS_PuzzleBg_init, 1, oldProt, &oldProt);
+
+    pfn_PS_PuzzleBg_releaseData(pBg);
+    pfn_PS_PuzzleBg_init(pBg, stageToApply);
+
+    VirtualProtect((void *)pfn_PS_PuzzleBg_init, 1, PAGE_EXECUTE_READWRITE, &oldProt);
+    *(BYTE *)pfn_PS_PuzzleBg_init = 0xCC;
+    VirtualProtect((void *)pfn_PS_PuzzleBg_init, 1, oldProt, &oldProt);
+
+    Log("[Patcher] Swapped puzzle background to theme %d\n", stageToApply);
+  }
+}
+
+void ExecuteNativeAutosolve(void *pGameMng) {
+  if (!pGameMng || IsBadReadPtr(pGameMng, 0x100)) return;
+  if (g_Off_GameMng_stage < 0 || g_Off_Stage_verLines < 0 ||
+      g_Off_Line_blocks < 0 || g_Off_Block_data < 0 ||
+      g_Off_BlockData_ANSWER < 0 || g_Off_BlockData_State < 0) {
+    Log("[AutoSolve] Error: field offsets not initialized!\n");
+    return;
+  }
+
+  void *pStage = *(void **)((char *)pGameMng + g_Off_GameMng_stage);
+  if (!pStage || IsBadReadPtr(pStage, 0x100)) {
+    Log("[AutoSolve] Error: pStage is null or invalid!\n");
+    return;
+  }
+
+  if (g_Off_GameMng_isClear >= 0) {
+    bool isClear = *(bool *)((char *)pGameMng + g_Off_GameMng_isClear);
+    if (isClear) {
+      Log("[AutoSolve] Puzzle is already cleared!\n");
+      return;
+    }
+  }
+
+  MonoArray *verLines = *(MonoArray **)((char *)pStage + g_Off_Stage_verLines);
+  if (!verLines || IsBadReadPtr(verLines, 0x20)) {
+    Log("[AutoSolve] Error: verLines array is null or invalid!\n");
+    return;
+  }
+
+  if (!mono_array_length || !mono_array_addr_with_size || !pfn_PS_Stage_onPaintCursor) {
+    Log("[AutoSolve] Error: mono array functions or _onPaintCursor missing!\n");
+    return;
+  }
+
+  uintptr_t width = mono_array_length(verLines);
+  Log("[AutoSolve] Starting native clicks for %llu columns...\n", (unsigned long long)width);
+
+  int cellsClicked = 0;
+  for (uintptr_t x = 0; x < width; x++) {
+    void **ppLine = (void **)mono_array_addr_with_size(verLines, sizeof(void *), x);
+    if (!ppLine || IsBadReadPtr(ppLine, sizeof(void *))) continue;
+    void *pLine = *ppLine;
+    if (!pLine || IsBadReadPtr(pLine, 0x100)) continue;
+
+    MonoArray *blocks = *(MonoArray **)((char *)pLine + g_Off_Line_blocks);
+    if (!blocks || IsBadReadPtr(blocks, 0x20)) continue;
+
+    uintptr_t height = mono_array_length(blocks);
+    for (uintptr_t y = 0; y < height; y++) {
+      void **ppBlock = (void **)mono_array_addr_with_size(blocks, sizeof(void *), y);
+      if (!ppBlock || IsBadReadPtr(ppBlock, sizeof(void *))) continue;
+      void *pBlock = *ppBlock;
+      if (!pBlock || IsBadReadPtr(pBlock, 0x100)) continue;
+
+      void *pBlockData = *(void **)((char *)pBlock + g_Off_Block_data);
+      if (!pBlockData || IsBadReadPtr(pBlockData, 0x40)) continue;
+
+      int answer = *(int *)((char *)pBlockData + g_Off_BlockData_ANSWER);
+      int curState = *(int *)((char *)pBlockData + g_Off_BlockData_State);
+
+      // Target: 1 (PAINT) if answer == 1, 3 (CROSS) if answer == 0
+      int targetState = (answer == 1) ? 1 : 3;
+      if (curState != targetState) {
+        pfn_PS_Stage_onPaintCursor(pStage, (int)x, (int)y, targetState);
+        cellsClicked++;
+      }
+    }
+  }
+  Log("[AutoSolve] Native clicks completed (%d cells clicked).\n", cellsClicked);
+
+  // Check if stage cleared; if not yet, trigger stage clear
+  if (g_Off_GameMng_isClear >= 0) {
+    bool isClear = *(bool *)((char *)pGameMng + g_Off_GameMng_isClear);
+    if (!isClear && pfn_PS_Stage_stageClear) {
+      Log("[AutoSolve] Triggering PS_Stage::_stageClear...\n");
+      pfn_PS_Stage_stageClear(pStage);
+    }
+  }
+
+  // Explicitly guarantee 0 hints used!
+  if (g_Off_GameMng_isUsedHint >= 0) {
+    *(bool *)((char *)pGameMng + g_Off_GameMng_isUsedHint) = false;
+  }
+}
+
 static const char *g_BakedIgnoreList[] = {
     "Body_000",         "Body_001",          "Body_002",
     "Body_003",         "Body_004",          "Body_005",
@@ -363,6 +681,64 @@ LONG WINAPI XRayHandler(PEXCEPTION_POINTERS ep) {
           ep->ContextRecord->Rax =
               31; // Greater than 31 means success for WinExec
           return EXCEPTION_CONTINUE_EXECUTION;
+        }
+      }
+
+      if (strcmp(activeHook->funcName, "isAnotherGame") == 0) {
+        if (IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW) {
+          int idx = (int)ep->ContextRecord->Rcx;
+          if (idx == 1 || idx == 2) {
+            Log("[Patcher] GamePlatform::isAnotherGame(%d) -> returning TRUE (SP35/SP36)\n", idx);
+            g_TamagotoriJigsawUnlocked = true;
+            SaveUnlockFlag();
+            ep->ContextRecord->Rax = 1;
+            ep->ContextRecord->Rip = *(uintptr_t *)ep->ContextRecord->Rsp;
+            ep->ContextRecord->Rsp += 8;
+            return EXCEPTION_CONTINUE_EXECUTION;
+          }
+        }
+      } else if (strcmp(activeHook->funcName, "PuzzleBg_init") == 0) {
+        int origStage = (int)ep->ContextRecord->Rdx;
+        g_LastOriginalStage = origStage;
+        if (g_ThemeOverride > 0) {
+          ep->ContextRecord->Rdx = (uint64_t)g_ThemeOverride;
+          Log("[Patcher] PS_PuzzleBg::init overriding stage %d -> %d\n", origStage, g_ThemeOverride);
+        }
+      } else if (strcmp(activeHook->funcName, "_convertSkinType") == 0) {
+        if (g_ThemeOverride > 0) {
+          ep->ContextRecord->Rdx = (uint64_t)g_ThemeOverride;
+          Log("[Patcher] PS_GameMng::_convertSkinType overriding stage to %d\n", g_ThemeOverride);
+        }
+      } else if (strcmp(activeHook->funcName, "GameMng_update") == 0) {
+        void *pGameMng = (void *)ep->ContextRecord->Rcx;
+        g_pCurrentGameMng = pGameMng;
+        g_LastGameMngTick = GetTickCount();
+
+        if (g_RequestAutoSolve) {
+          g_RequestAutoSolve = false;
+          if (IamDIRTYlittleCHEATERandDONTwantTOplayTHISgame) {
+            ExecuteNativeAutosolve(pGameMng);
+          }
+        }
+        if (g_PendingThemeChange >= 0) {
+          int t = g_PendingThemeChange;
+          g_PendingThemeChange = -1;
+          ExecuteThemeChange(pGameMng, t);
+        }
+      } else if (strcmp(activeHook->funcName, "MainMenu_Update") == 0) {
+        void *pMainMenu = (void *)ep->ContextRecord->Rcx;
+        g_pCurrentMainMenu = pMainMenu;
+
+        if (IamNOTwaitingFORcryptonTOaddGAMEStoSTEAMandWANTtoUNLOCKpuzzlesNOW) {
+          static bool s_AutoChecked = false;
+          if (!s_AutoChecked || g_RequestUnlockTamagotoriJigsaw) {
+            s_AutoChecked = true;
+            g_RequestUnlockTamagotoriJigsaw = false;
+            if (pfn_MainMenu_checkPastSoft) {
+              Log("[Patcher] Executing MainMenu::_checkPastSoft\n");
+              pfn_MainMenu_checkPastSoft(pMainMenu);
+            }
+          }
         }
       }
 
@@ -602,6 +978,10 @@ void StartPatching() {
       (mono_method_get_name_t)GetMonoFunc("mono_method_get_name");
   mono_method_full_name =
       (mono_method_full_name_t)GetMonoFunc("mono_method_full_name");
+  mono_class_get_method_from_name =
+      (mono_class_get_method_from_name_t)GetMonoFunc("mono_class_get_method_from_name");
+  mono_array_length =
+      (mono_array_length_t)GetMonoFunc("mono_array_length");
 
   MonoDomain *domain = mono_get_root_domain();
   if (!domain)
@@ -616,10 +996,15 @@ void StartPatching() {
   MonoImage *image = mono_assembly_get_image(assembly);
   g_XRay.image = image;
 
+  // Load configs
+  LoadThemeConfig();
+  LoadUnlockFlag();
+  LoadCheatConfig();
+
+  AddVectoredExceptionHandler(1, XRayHandler);
+
   MonoClass *costumeClass = mono_class_from_name(image, "", "PS_Costume");
   if (costumeClass) {
-    AddVectoredExceptionHandler(1, XRayHandler);
-
     const char *targetMethods[] = {"changeCostume", "_setHead", "_setBody",
                                    "_loadAndSetHeadSpLibAsset",
                                    "_loadAndSetBodySpLibAsset"};
@@ -631,23 +1016,123 @@ void StartPatching() {
         for (const char *t : targetMethods) {
           if (strcmp(mname, t) == 0) {
             void *target = mono_compile_method(m);
-
-            HookData hook;
-            hook.target = target;
-            hook.originalByte = *(BYTE *)target;
-            hook.funcName = t;
-            g_XRay.hooks.push_back(hook);
-
-            DWORD old;
-            if (VirtualProtect(target, 1, PAGE_EXECUTE_READWRITE, &old)) {
-              *(BYTE *)target = 0xCC;
-              VirtualProtect(target, 1, old, &old);
-              Log("[Patcher] X-Ray Trap Active: %s @ %p\n", t, target);
-            }
+            InstallHook(target, t);
             break;
           }
         }
       }
+    }
+  }
+
+  // Hook GamePlatform::isAnotherGame(int idx) for selective SP35/SP36 unlock
+  MonoClass *gpClass = mono_class_from_name(image, "", "GamePlatform");
+  if (gpClass && mono_class_get_method_from_name) {
+    MonoMethod *mIsAnother = mono_class_get_method_from_name(gpClass, "isAnotherGame", 1);
+    if (mIsAnother) {
+      void *target = mono_compile_method(mIsAnother);
+      InstallHook(target, "isAnotherGame");
+    }
+  }
+
+  // Hook PS_PuzzleBg::init & compile releaseData for theme swapping
+  MonoClass *bgClass = mono_class_from_name(image, "", "PS_PuzzleBg");
+  if (bgClass && mono_class_get_method_from_name) {
+    MonoMethod *mInit = mono_class_get_method_from_name(bgClass, "init", 1);
+    if (mInit) {
+      pfn_PS_PuzzleBg_init = (PS_PuzzleBg_init_fn)mono_compile_method(mInit);
+      g_OrigByte_PuzzleBg_init = *(BYTE *)pfn_PS_PuzzleBg_init;
+      InstallHook((void *)pfn_PS_PuzzleBg_init, "PuzzleBg_init");
+    }
+    MonoMethod *mRel = mono_class_get_method_from_name(bgClass, "releaseData", 0);
+    if (mRel) {
+      pfn_PS_PuzzleBg_releaseData = (PS_PuzzleBg_releaseData_fn)mono_compile_method(mRel);
+      Log("[Patcher] PS_PuzzleBg::releaseData compiled @ %p\n", pfn_PS_PuzzleBg_releaseData);
+    }
+  }
+
+  // Hook PS_GameMng::_convertSkinType and PS_GameMng::update
+  MonoClass *gameMngClass = mono_class_from_name(image, "", "PS_GameMng");
+  if (gameMngClass && mono_class_get_method_from_name) {
+    MonoMethod *mSkin = mono_class_get_method_from_name(gameMngClass, "_convertSkinType", 1);
+    if (mSkin) {
+      void *target = mono_compile_method(mSkin);
+      InstallHook(target, "_convertSkinType");
+    }
+    MonoMethod *mUpdate = mono_class_get_method_from_name(gameMngClass, "update", 0);
+    if (mUpdate) {
+      void *target = mono_compile_method(mUpdate);
+      InstallHook(target, "GameMng_update");
+    }
+
+    g_Off_GameMng_stage = GetFieldOffset(gameMngClass, "stage");
+    g_Off_GameMng_scene = GetFieldOffset(gameMngClass, "scene");
+    g_Off_GameMng_isUsedHint = GetFieldOffset(gameMngClass, "isUsedHint");
+    g_Off_GameMng_isClear = GetFieldOffset(gameMngClass, "<IsClear>k__BackingField");
+    g_Off_GameMng_isStartGame = GetFieldOffset(gameMngClass, "<IsStartGame>k__BackingField");
+    Log("[Patcher] PS_GameMng offsets: stage=%d scene=%d hint=%d clear=%d start=%d\n",
+        g_Off_GameMng_stage, g_Off_GameMng_scene, g_Off_GameMng_isUsedHint,
+        g_Off_GameMng_isClear, g_Off_GameMng_isStartGame);
+  }
+
+  // Puzzle fields
+  MonoClass *puzzleClass = mono_class_from_name(image, "", "Puzzle");
+  if (puzzleClass) {
+    g_Off_Puzzle_bg = GetFieldOffset(puzzleClass, "bg");
+    Log("[Patcher] Puzzle offset: bg=%d\n", g_Off_Puzzle_bg);
+  }
+
+  // PS_Stage methods & fields
+  MonoClass *stageClass = mono_class_from_name(image, "", "PS_Stage");
+  if (stageClass && mono_class_get_method_from_name) {
+    MonoMethod *mPaint = mono_class_get_method_from_name(stageClass, "_onPaintCursor", 3);
+    if (mPaint) {
+      pfn_PS_Stage_onPaintCursor = (PS_Stage_onPaintCursor_fn)mono_compile_method(mPaint);
+      Log("[Patcher] PS_Stage::_onPaintCursor compiled @ %p\n", pfn_PS_Stage_onPaintCursor);
+    }
+    MonoMethod *mClear = mono_class_get_method_from_name(stageClass, "_stageClear", 0);
+    if (mClear) {
+      pfn_PS_Stage_stageClear = (PS_Stage_stageClear_fn)mono_compile_method(mClear);
+      Log("[Patcher] PS_Stage::_stageClear compiled @ %p\n", pfn_PS_Stage_stageClear);
+    }
+    g_Off_Stage_verLines = GetFieldOffset(stageClass, "verLines");
+    Log("[Patcher] PS_Stage offset: verLines=%d\n", g_Off_Stage_verLines);
+  }
+
+  // PS_Line fields
+  MonoClass *lineClass = mono_class_from_name(image, "", "PS_Line");
+  if (lineClass) {
+    g_Off_Line_blocks = GetFieldOffset(lineClass, "blocks");
+    Log("[Patcher] PS_Line offset: blocks=%d\n", g_Off_Line_blocks);
+  }
+
+  // PS_Block fields
+  MonoClass *blockClass = mono_class_from_name(image, "", "PS_Block");
+  if (blockClass) {
+    g_Off_Block_data = GetFieldOffset(blockClass, "data");
+    Log("[Patcher] PS_Block offset: data=%d\n", g_Off_Block_data);
+  }
+
+  // PS_BlockData fields
+  MonoClass *blockDataClass = mono_class_from_name(image, "", "PS_BlockData");
+  if (blockDataClass) {
+    g_Off_BlockData_ANSWER = GetFieldOffset(blockDataClass, "ANSWER");
+    g_Off_BlockData_State = GetFieldOffset(blockDataClass, "<State>k__BackingField");
+    Log("[Patcher] PS_BlockData offsets: ANSWER=%d State=%d\n",
+        g_Off_BlockData_ANSWER, g_Off_BlockData_State);
+  }
+
+  // MainMenu::_checkPastSoft and MainMenu::Update
+  MonoClass *mainMenuClass = mono_class_from_name(image, "", "MainMenu");
+  if (mainMenuClass && mono_class_get_method_from_name) {
+    MonoMethod *mPastSoft = mono_class_get_method_from_name(mainMenuClass, "_checkPastSoft", 0);
+    if (mPastSoft) {
+      pfn_MainMenu_checkPastSoft = (MainMenu_checkPastSoft_fn)mono_compile_method(mPastSoft);
+      Log("[Patcher] MainMenu::_checkPastSoft compiled @ %p\n", pfn_MainMenu_checkPastSoft);
+    }
+    MonoMethod *mMMUpdate = mono_class_get_method_from_name(mainMenuClass, "Update", 0);
+    if (mMMUpdate) {
+      void *target = mono_compile_method(mMMUpdate);
+      InstallHook(target, "MainMenu_Update");
     }
   }
 
